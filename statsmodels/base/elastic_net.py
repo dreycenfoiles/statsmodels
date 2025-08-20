@@ -409,6 +409,10 @@ class RegularizedResults(Results):
         """
         return self.model.predict(self.params)
 
+    @cache_readonly
+    def resid(self):
+        return self.model.endog - self.fittedvalues
+
     def summary(self, yname=None, xname=None, title=None):
         """Create a summary table for regularized regression results.
 
@@ -420,6 +424,8 @@ class RegularizedResults(Results):
         from statsmodels.iolib.summary import Summary
         from statsmodels.iolib.table import SimpleTable
         import datetime as _dt
+        import numpy.linalg as npl
+        from statsmodels.stats.stattools import durbin_watson, jarque_bera, omni_normtest
 
         model = self.model
         if yname is None:
@@ -431,47 +437,86 @@ class RegularizedResults(Results):
 
         # Top info (mirrors style of other summaries where possible)
         now = _dt.datetime.now()
+        y = model.endog
+        fv = self.fittedvalues
+        resid = y - fv
+        nobs = len(y)
+        exog = model.exog
+        # Detect constant
+        k_constant = int(np.any(np.allclose(exog, exog[:, [0]], rtol=0, atol=1e-12)))
+        # Center y if constant present
+        if k_constant:
+            y_centered = y - y.mean()
+        else:
+            y_centered = y
+        sst = float(np.dot(y_centered, y_centered))
+        ssr = float(np.dot(resid, resid))
+        rsq = np.nan if sst == 0 else 1 - ssr/sst
+        # Selected params excluding constant (assume constant is first col if present)
+        sel_mask = self.params != 0
+        if k_constant and sel_mask.shape[0] > 0:
+            sel_mask[0] = False  # exclude constant from model df
+        df_model = int(sel_mask.sum())
+        df_resid = max(nobs - df_model - k_constant, 0)
+        rsq_adj = np.nan
+        if df_resid > 0 and nobs > k_constant + 1 and not np.isnan(rsq):
+            rsq_adj = 1 - (1 - rsq)*(nobs - k_constant - 1)/(df_resid)
+
+        # Condition number via singular values
+        try:
+            svals = npl.svd(exog, full_matrices=False, compute_uv=False)
+            condno = np.nan if svals[-1] == 0 else svals[0]/svals[-1]
+        except Exception:
+            condno = np.nan
+
+        # Basic residual diagnostics (distribution) -- informational only
+        try:
+            jb, jbpv, skew, kurt = jarque_bera(resid)
+            omni, omnipv = omni_normtest(resid)
+        except Exception:
+            jb = jbpv = skew = kurt = omni = omnipv = np.nan
+
+        # Replace previous top_left creation with enriched version
+        now = _dt.datetime.now()
         top_left = [
             ('Dep. Variable:', [yname]),
             ('Model:', [model.__class__.__name__]),
             ('Method:', [getattr(self, 'penalty', 'Regularized')]),
             ('Date:', [now.strftime('%Y-%m-%d')]),
             ('Time:', [now.strftime('%H:%M:%S')]),
-            ('No. Observations:', [str(getattr(model, 'nobs', 'NA'))]),
-            ('Df Residuals:', [str(getattr(model, 'nobs', 0) - getattr(self, 'n_selected', 0))]),
-            ('Df Model:', [str(getattr(self, 'n_selected', 'NA'))]),
+            ('No. Observations:', [str(nobs)]),
+            ('Df Residuals:', [str(df_resid)]),
+            ('Df Model:', [str(df_model)]),
         ]
-
-        # Right panel with penalty specifics
-        alpha = self.alpha
-        # Normalize alpha to numpy array for uniform processing
-        if alpha is None:
-            alpha_arr = None
-        elif isinstance(alpha, (int, float)):
-            alpha_arr = np.array([alpha])
+        # Right panel with goodness-of-fit
+        rsq_lab = 'R-squared' + ('' if k_constant else ' (uncentered)')
+        # Compute unpenalized log-likelihood at penalized estimates (heuristic)
+        llf = np.nan
+        try:
+            llf = float(model.loglike(self.params))
+        except Exception:  # pragma: no cover - defensive
+            llf = np.nan
+        k_params_eff = int((self.params != 0).sum())
+        if not np.isnan(llf):
+            aic = -2 * llf + 2 * k_params_eff
+            bic = -2 * llf + k_params_eff * np.log(nobs)
         else:
-            alpha_arr = alpha
-        if alpha_arr is None:
-            alpha_disp = 'NA'
-        elif alpha_arr.size == 1:
-            alpha_disp = f"{alpha_arr[0]:.4g}"
-        elif np.all(alpha_arr == alpha_arr[0]):
-            alpha_disp = f"{alpha_arr[0]:.4g}"
-        else:
-            alpha_disp = 'varies'
+            aic = np.nan
+            bic = np.nan
         top_right = [
-            ('Penalty Weight (alpha):', [alpha_disp]),
-            ('L1 Fraction (L1_wt):', [f"{getattr(self, 'L1_wt', float('nan')):.3f}"]),
-            ('Selected Vars:', [str(getattr(self, 'n_selected', 'NA'))]),
-            ('Converged:', [str(getattr(self, 'converged', 'NA'))]),
+            (rsq_lab + ':', [f"{rsq: #8.3f}" if not np.isnan(rsq) else '   NA']),
+            ('Adj. R-squared:', [f"{rsq_adj: #8.3f}" if not np.isnan(rsq_adj) else '   NA']),
+            ('SSE (Residual Sum of Squares):', [f"{ssr: #8.4g}"]),
+            ('Log-Likelihood:', [f"{llf: #8.3f}" if not np.isnan(llf) else '   NA']),
+            ('AIC:', [f"{aic: #8.3f}" if not np.isnan(aic) else '   NA']),
+            ('BIC:', [f"{bic: #8.3f}" if not np.isnan(bic) else '   NA'])
         ]
 
         smry = Summary()
         smry.add_table_2cols(self, gleft=top_left, gright=top_right,
                              yname=yname, xname=xname,
                              title=title or 'Regularized Regression Results')
-
-        # Parameter table: show all coefficients, indicate selection
+        # Parameter table (unchanged)
         params = self.params
         selected = params != 0
         rows = []
@@ -481,10 +526,25 @@ class RegularizedResults(Results):
         param_table = SimpleTable(rows, header)
         smry.tables.append(param_table)
 
+        # Diagnostics table similar style to OLS but limited
+        diagn_left = [
+            ('Durbin-Watson:', [f"{durbin_watson(resid): #8.3f}"]),
+            ('Jarque-Bera:', [f"{jb: #8.3f}" if not np.isnan(jb) else '   NA']),
+            ('Prob(JB):', [f"{jbpv: #8.3g}" if not np.isnan(jbpv) else '   NA']),
+        ]
+        diagn_right = [
+            ('Skew:', [f"{skew: #8.3f}" if not np.isnan(skew) else '   NA']),
+            ('Kurtosis:', [f"{kurt: #8.3f}" if not np.isnan(kurt) else '   NA']),
+            ('Cond. No.', [f"{condno: #8.3g}" if not np.isnan(condno) else '   NA'])
+        ]
+        smry.add_table_2cols(self, gleft=diagn_left, gright=diagn_right, yname=yname, xname=xname, title="")
+
         notes = [
             '[1] Coefficients are penalized and generally biased.',
             '[2] No standard errors or p-values are reported for penalized fit.',
-            '[3] Set refit=True in fit_regularized to obtain unpenalized inference on the selected model.'
+            '[3] R-squared values are heuristic for penalized estimation.',
+            '[4] Use refit=True for unpenalized estimates on selected model (selection uncertainty ignored).',
+            '[5] Log-Likelihood, AIC, BIC use the unpenalized loglike at penalized params and effective k = #nonzero coefficients.'
         ]
         smry.add_extra_txt(['Notes:'] + notes)
         return smry
