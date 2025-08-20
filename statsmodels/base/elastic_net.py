@@ -2,6 +2,7 @@ import numpy as np
 from statsmodels.base.model import Results
 import statsmodels.base.wrapper as wrap
 from statsmodels.tools.decorators import cache_readonly
+from typing import Optional, Union  # added for attribute annotations
 
 """
 Elastic net regularization.
@@ -166,7 +167,7 @@ def fit_elasticnet(model, method="coord_descent", maxiter=100,
         for k in range(k_exog)]
 
     converged = False
-
+    itr = -1  # initialize in case maxiter == 0
     for itr in range(maxiter):
 
         # Sweep through the parameters
@@ -215,7 +216,21 @@ def fit_elasticnet(model, method="coord_descent", maxiter=100,
     if not refit:
         results = RegularizedResults(model, params)
         results.converged = converged
-        return RegularizedResultsWrapper(results)
+        # Store penalty metadata for summary construction
+        results.alpha = alpha
+        results.L1_wt = L1_wt
+        if np.all(alpha == 0):
+            results.penalty = 'None'
+        else:
+            if L1_wt == 1:
+                results.penalty = 'Lasso'
+            elif L1_wt == 0:
+                results.penalty = 'Ridge'
+            else:
+                results.penalty = 'Elastic Net'
+        results.n_selected = int(np.sum(params != 0))
+        from statsmodels.base.elastic_net import RegularizedResultsWrapper as _RRW  # local import to avoid issues
+        return _RRW(results)
 
     # Fit the reduced model to get standard errors and other
     # post-estimation results.
@@ -350,9 +365,13 @@ def _opt_1d(func, grad, hess, model, start, L1_wt, tol,
         return x + h
 
     # Fallback for models where the loss is not quadratic
-    from scipy.optimize import brent
-    x_opt = brent(func, args=(model,), brack=(x-1, x+1), tol=tol)
-    return x_opt
+    try:
+        from scipy.optimize import brent  # type: ignore
+        x_opt = brent(func, args=(model,), brack=(x-1, x+1), tol=tol)
+        return x_opt
+    except Exception:
+        # If scipy not available, return current best step
+        return x + h
 
 
 class RegularizedResults(Results):
@@ -366,8 +385,22 @@ class RegularizedResults(Results):
     params : ndarray
         The estimated (regularized) parameters.
     """
+    alpha: Union[float, np.ndarray, None]
+    L1_wt: Optional[float]
+    penalty: Optional[str]
+    n_selected: Optional[int]
+    converged: Optional[bool]
+    method: Optional[str]
+
     def __init__(self, model, params):
         super().__init__(model, params)
+        # initialize metadata attributes
+        self.alpha = None
+        self.L1_wt = None
+        self.penalty = None
+        self.n_selected = None
+        self.converged = None
+        self.method = None
 
     @cache_readonly
     def fittedvalues(self):
@@ -375,6 +408,86 @@ class RegularizedResults(Results):
         The predicted values from the model at the estimated parameters.
         """
         return self.model.predict(self.params)
+
+    def summary(self, yname=None, xname=None, title=None):
+        """Create a summary table for regularized regression results.
+
+        Notes
+        -----
+        This summary is limited because standard errors and inferential
+        statistics are not available for the penalized fit without refit.
+        """
+        from statsmodels.iolib.summary import Summary
+        from statsmodels.iolib.table import SimpleTable
+        import datetime as _dt
+
+        model = self.model
+        if yname is None:
+            yname = getattr(model, 'endog_names', 'y')
+        if xname is None:
+            xname = getattr(model, 'exog_names', None)
+        if xname is None:
+            xname = [f'var_{i}' for i in range(len(self.params))]
+
+        # Top info (mirrors style of other summaries where possible)
+        now = _dt.datetime.now()
+        top_left = [
+            ('Dep. Variable:', [yname]),
+            ('Model:', [model.__class__.__name__]),
+            ('Method:', [getattr(self, 'penalty', 'Regularized')]),
+            ('Date:', [now.strftime('%Y-%m-%d')]),
+            ('Time:', [now.strftime('%H:%M:%S')]),
+            ('No. Observations:', [str(getattr(model, 'nobs', 'NA'))]),
+            ('Df Residuals:', [str(getattr(model, 'nobs', 0) - getattr(self, 'n_selected', 0))]),
+            ('Df Model:', [str(getattr(self, 'n_selected', 'NA'))]),
+        ]
+
+        # Right panel with penalty specifics
+        alpha = self.alpha
+        # Normalize alpha to numpy array for uniform processing
+        if alpha is None:
+            alpha_arr = None
+        elif isinstance(alpha, (int, float)):
+            alpha_arr = np.array([alpha])
+        else:
+            alpha_arr = alpha
+        if alpha_arr is None:
+            alpha_disp = 'NA'
+        elif alpha_arr.size == 1:
+            alpha_disp = f"{alpha_arr[0]:.4g}"
+        elif np.all(alpha_arr == alpha_arr[0]):
+            alpha_disp = f"{alpha_arr[0]:.4g}"
+        else:
+            alpha_disp = 'varies'
+        top_right = [
+            ('Penalty Weight (alpha):', [alpha_disp]),
+            ('L1 Fraction (L1_wt):', [f"{getattr(self, 'L1_wt', float('nan')):.3f}"]),
+            ('Selected Vars:', [str(getattr(self, 'n_selected', 'NA'))]),
+            ('Converged:', [str(getattr(self, 'converged', 'NA'))]),
+        ]
+
+        smry = Summary()
+        smry.add_table_2cols(self, gleft=top_left, gright=top_right,
+                             yname=yname, xname=xname,
+                             title=title or 'Regularized Regression Results')
+
+        # Parameter table: show all coefficients, indicate selection
+        params = self.params
+        selected = params != 0
+        rows = []
+        for name, val, sel in zip(xname, params, selected):
+            rows.append([name, f"{val: .6g}", 'Yes' if sel else 'No'])
+        header = ['Variable', 'Coefficient', 'Selected']
+        param_table = SimpleTable(rows, header)
+        smry.tables.append(param_table)
+
+        notes = [
+            '[1] Coefficients are penalized and generally biased.',
+            '[2] No standard errors or p-values are reported for penalized fit.',
+            '[3] Set refit=True in fit_regularized to obtain unpenalized inference on the selected model.'
+        ]
+        smry.add_extra_txt(['Notes:'] + notes)
+        return smry
 
 
 class RegularizedResultsWrapper(wrap.ResultsWrapper):
